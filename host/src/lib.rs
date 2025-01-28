@@ -22,6 +22,7 @@ use crate::channel_manager::{ChannelStorage, PacketChannel};
 use crate::connection_manager::{ConnectionStorage, EventChannel};
 use crate::l2cap::sar::SarType;
 use crate::packet_pool::{PacketPool, Qos};
+use crate::security_manager::SecurityManagerError;
 
 mod fmt;
 
@@ -35,10 +36,12 @@ mod codec;
 mod command;
 pub mod config;
 mod connection_manager;
+mod crypto;
 mod cursor;
 pub mod packet_pool;
 mod pdu;
 pub mod peripheral;
+mod security_manager;
 pub mod types;
 
 pub use packet_pool::Qos as PacketQos;
@@ -116,6 +119,14 @@ impl Address {
             addr: BdAddr::new(val),
         }
     }
+
+    /// To bytes
+    pub fn to_bytes(&self) -> [u8; 7] {
+        let mut bytes = [0; 7];
+        bytes[0] = self.kind.into_inner();
+        bytes[1..].copy_from_slice(&self.addr.into_inner());
+        bytes
+    }
 }
 
 /// Errors returned by the host.
@@ -138,6 +149,8 @@ pub enum Error {
     HciDecode(FromHciBytesError),
     /// Error from the Attribute Protocol.
     Att(AttErrorCode),
+    /// Error from the security manager
+    Security(SecurityManagerError),
     /// Insufficient space in the buffer.
     InsufficientSpace,
     /// Invalid value.
@@ -299,6 +312,8 @@ pub struct HostResources<
 > {
     qos: Qos,
     rx_pool: MaybeUninit<PacketPool<NoopRawMutex, L2CAP_MTU, { config::L2CAP_RX_PACKET_POOL_SIZE }, CHANNELS>>,
+    #[cfg(feature = "gatt")]
+    gatt_pool: MaybeUninit<PacketPool<NoopRawMutex, L2CAP_MTU, { config::GATT_PACKET_POOL_SIZE }, 1>>,
     connections: MaybeUninit<[ConnectionStorage; CONNS]>,
     events: MaybeUninit<[EventChannel<'static>; CONNS]>,
     channels: MaybeUninit<[ChannelStorage; CHANNELS]>,
@@ -316,6 +331,8 @@ impl<C: Controller, const CONNS: usize, const CHANNELS: usize, const L2CAP_MTU: 
         Self {
             qos,
             rx_pool: MaybeUninit::uninit(),
+            #[cfg(feature = "gatt")]
+            gatt_pool: MaybeUninit::uninit(),
             connections: MaybeUninit::uninit(),
             events: MaybeUninit::uninit(),
             sar: MaybeUninit::uninit(),
@@ -355,6 +372,13 @@ pub fn new<
         core::mem::transmute::<&'d dyn GlobalPacketPool<'d>, &'static dyn GlobalPacketPool<'static>>(rx_pool)
     };
 
+    #[cfg(feature = "gatt")]
+    let gatt_pool: &'d dyn GlobalPacketPool<'d> = &*resources.gatt_pool.write(PacketPool::new(PacketQos::None));
+    #[cfg(feature = "gatt")]
+    let gatt_pool = unsafe {
+        core::mem::transmute::<&'d dyn GlobalPacketPool<'d>, &'static dyn GlobalPacketPool<'static>>(gatt_pool)
+    };
+
     let connections = &mut *resources.connections.write([ConnectionStorage::DISCONNECTED; CONNS]);
     let connections = unsafe { transmute_slice(connections) };
     let events = &mut *resources.events.write([const { EventChannel::new() }; CONNS]);
@@ -370,6 +394,8 @@ pub fn new<
     let host = BleHost::new(
         controller,
         rx_pool,
+        #[cfg(feature = "gatt")]
+        gatt_pool,
         connections,
         events,
         channels,
