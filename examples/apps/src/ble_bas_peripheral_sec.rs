@@ -1,6 +1,6 @@
 use embassy_futures::join::join;
 use embassy_futures::select::select;
-use embassy_time::Timer;
+use embassy_time::{Duration, Timer};
 use rand_core::{CryptoRng, RngCore};
 use trouble_host::prelude::*;
 
@@ -58,6 +58,65 @@ where
         loop {
             match advertise("Trouble Example", &mut peripheral, &server).await {
                 Ok(conn) => {
+                    // Update the connection parameters
+                    // For macOS/iOS(aka Apple devices), both interval should be set to 15ms
+                    if let Err(e) = conn
+                        .raw()
+                        .update_connection_params(
+                            &stack,
+                            &ConnectParams {
+                                min_connection_interval: Duration::from_millis(15),
+                                max_connection_interval: Duration::from_millis(15),
+                                max_latency: 25,
+                                event_length: Duration::from_secs(0),
+                                supervision_timeout: Duration::from_secs(6),
+                            },
+                        )
+                        .await
+                    {
+                        #[cfg(feature = "defmt")]
+                        let e = defmt::Debug2Format(&e);
+                        error!("[set_conn_params] error: {:?}", e);
+                    }
+
+                    // The second try
+                    match conn
+                        .raw()
+                        .update_connection_params(
+                            &stack,
+                            &ConnectParams {
+                                min_connection_interval: Duration::from_micros(7500),
+                                max_connection_interval: Duration::from_micros(7500),
+                                max_latency: 99,
+                                event_length: Duration::from_secs(0),
+                                supervision_timeout: Duration::from_secs(5),
+                            },
+                        )
+                        .await
+                    {
+                        Err(BleHostError::BleHost(Error::Hci(error))) => {
+                            if 0x2A == error.to_status().into_inner() {
+                                // Busy, retry
+                                info!("[set_conn_params] 2nd time HCI busy: {:?}", error);
+                            } else {
+                                error!("[set_conn_params] 2nd time HCI error: {:?}", error);
+                            }
+                        }
+                        Err(e) => match e {
+                            BleHostError::Controller(error) => {
+                                #[cfg(feature = "defmt")]
+                                let error = defmt::Debug2Format(&error);
+                                error!("[set_conn_params] 2nd time Controller error: {:?}", error);
+                            }
+                            BleHostError::BleHost(error) => {
+                                #[cfg(feature = "defmt")]
+                                let error = defmt::Debug2Format(&error);
+                                error!("[set_conn_params] 2nd time BleHost error: {:?}", error);
+                            }
+                        },
+                        _ => break,
+                    };
+
                     // set up tasks when the connection is established to a central, so they don't run when no one is connected.
                     let a = gatt_events_task(&server, &conn);
                     let b = custom_task(&server, &conn, &stack);

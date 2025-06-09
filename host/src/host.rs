@@ -840,6 +840,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                         event.handle, e
                                     );
                                 } else {
+                                    info!("Got ConnectionUpdateComplete for handle {:?}, conn_interval: {:?}, peripheral_latency: {:?}, supervision_timeout: {:?}", event.handle, event.conn_interval, event.peripheral_latency, event.supervision_timeout);
                                     let _ = host.connections.post_handle_event(
                                         event.handle,
                                         ConnectionEvent::ConnectionParamsUpdated {

@@ -307,6 +307,19 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
         T: ControllerCmdAsync<LeConnUpdate>,
     {
         let handle = self.handle();
+        info!(
+            "Updating connection parameters for connection {:?}: {:?}",
+            handle,
+            LeConnUpdate::new(
+                handle,
+                params.min_connection_interval.into(),
+                params.max_connection_interval.into(),
+                params.max_latency,
+                params.supervision_timeout.into(),
+                params.event_length.into(),
+                params.event_length.into(),
+            )
+        );
         match stack
             .host
             .async_command(LeConnUpdate::new(
@@ -322,6 +335,7 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
         {
             Ok(_) => Ok(()),
             Err(BleHostError::BleHost(crate::Error::Hci(bt_hci::param::Error::UNKNOWN_CONN_IDENTIFIER))) => {
+                info!("Connection {:?} is no longer valid", handle);
                 Err(crate::Error::Disconnected.into())
             }
             Err(e) => Err(e),
