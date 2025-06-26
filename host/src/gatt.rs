@@ -9,8 +9,9 @@ use bt_hci::uuid::declarations::{CHARACTERISTIC, PRIMARY_SERVICE};
 use bt_hci::uuid::descriptors::CLIENT_CHARACTERISTIC_CONFIGURATION;
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::{NoopRawMutex, RawMutex};
-use embassy_sync::channel::{Channel, DynamicReceiver};
+use embassy_sync::channel::Channel;
 use embassy_sync::pubsub::{self, PubSubChannel, WaitResult};
+use embassy_sync::waitqueue::WakerRegistration;
 use embassy_time::Duration;
 use heapless::Vec;
 
@@ -563,7 +564,6 @@ const NOTIF_QSIZE: usize = config::GATT_CLIENT_NOTIFICATION_QUEUE_SIZE;
 /// A GATT client capable of using the GATT protocol.
 pub struct GattClient<'reference, T: Controller, P: PacketPool, const MAX_SERVICES: usize> {
     known_services: RefCell<Vec<ServiceHandle, MAX_SERVICES>>,
-    rx: DynamicReceiver<'reference, (ConnHandle, Pdu<P::Packet>)>,
     stack: &'reference Stack<'reference, T, P>,
     connection: Connection<'reference, P>,
     response_channel: Channel<NoopRawMutex, (ConnHandle, Pdu<P::Packet>), 1>,
@@ -665,9 +665,9 @@ impl<'reference, C: Controller, P: PacketPool, const MAX_SERVICES: usize> GattCl
 
         let len = w.len();
         connection.send(Pdu::new(buf, len)).await;
+
         Ok(Self {
             known_services: RefCell::new(heapless::Vec::new()),
-            rx: stack.host.att_client.receiver().into(),
             stack,
             connection: connection.clone(),
 
@@ -1006,13 +1006,20 @@ impl<'reference, C: Controller, P: PacketPool, const MAX_SERVICES: usize> GattCl
     /// Task which handles GATT rx data (needed for notifications to work)
     pub async fn task(&self) -> Result<(), BleHostError<C::Error>> {
         loop {
-            let (handle, pdu) = self.rx.receive().await;
+            // Use the new receive method which handles RefCell borrows safely
+            let pdu = self
+                .stack
+                .host
+                .gatt_client_manager
+                .receive(self.connection.handle())
+                .await?;
+
             let data = pdu.as_ref();
             // handle notifications
             if pdu.as_ref()[0] == ATT_HANDLE_VALUE_NTF {
                 self.handle_notification_packet(&pdu.as_ref()[1..]).await?;
             } else {
-                self.response_channel.send((handle, pdu)).await;
+                self.response_channel.send((self.connection.handle(), pdu)).await;
             }
         }
     }
@@ -1022,6 +1029,118 @@ impl<'reference, C: Controller, P: PacketPool, const MAX_SERVICES: usize> GattCl
         match att {
             Att::Server(AttServer::Response(rsp)) => Ok(rsp),
             _ => Err(Error::UnexpectedGattResponse.into()),
+        }
+    }
+}
+
+/// GATT client inner state that needs RefCell protection
+#[cfg(feature = "gatt")]
+struct GattClientInnerState<P: PacketPool> {
+    // Array of channels, one for each potential connection
+    channels: [Option<Channel<NoopRawMutex, Pdu<P::Packet>, { config::L2CAP_RX_QUEUE_SIZE }>>;
+        config::GATT_CLIENT_MAX_CONNECTIONS],
+    // Mapping from connection handles to channel indices
+    handle_to_index: heapless::FnvIndexMap<ConnHandle, u8, { config::GATT_CLIENT_MAX_CONNECTIONS }>,
+    // Waker registration for notification
+    waker: WakerRegistration,
+}
+
+/// GATT client manager that maintains separate channels for each connection
+#[cfg(feature = "gatt")]
+pub(crate) struct GattClientManager<P: PacketPool> {
+    state: RefCell<GattClientInnerState<P>>,
+}
+
+#[cfg(feature = "gatt")]
+impl<P: PacketPool> GattClientManager<P> {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: RefCell::new(GattClientInnerState {
+                channels: core::array::from_fn(|_| None),
+                handle_to_index: heapless::FnvIndexMap::new(),
+                waker: WakerRegistration::new(),
+            }),
+        }
+    }
+
+    /// Get or create a channel index for the given connection handle
+    fn get_or_create_channel_index(&self, handle: ConnHandle) -> Result<u8, Error> {
+        let mut state = self.state.borrow_mut();
+
+        // Check if we already have a channel for this handle
+        if let Some(index) = state.handle_to_index.get(&handle) {
+            return Ok(*index);
+        }
+
+        // Find an empty slot
+        for i in 0..state.channels.len() {
+            if state.channels[i].is_none() {
+                state.channels[i] = Some(Channel::new());
+                // Update the mapping
+                state
+                    .handle_to_index
+                    .insert(handle, i as u8)
+                    .map_err(|_| Error::OutOfMemory)?;
+                return Ok(i as u8);
+            }
+        }
+
+        // No empty slot found, return error
+        Err(Error::OutOfMemory)
+    }
+
+    /// Receive a message for a specific connection handle
+    pub(crate) async fn receive(&self, handle: ConnHandle) -> Result<Pdu<P::Packet>, Error> {
+        let index = self.get_or_create_channel_index(handle)?;
+
+        core::future::poll_fn(|cx| {
+            // Poll the channel for a message
+            let poll_result = {
+                let mut state = self.state.borrow_mut();
+                state.waker.register(cx.waker());
+
+                if let Some(ref channel) = state.channels[index as usize] {
+                    match channel.try_receive() {
+                        Ok(pdu) => Some(Ok(pdu)),
+                        Err(embassy_sync::channel::TryReceiveError::Empty) => None,
+                    }
+                } else {
+                    Some(Err(Error::InvalidState))
+                }
+            };
+
+            match poll_result {
+                Some(result) => core::task::Poll::Ready(result),
+                None => core::task::Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    /// Send a PDU to the appropriate channel for the given connection handle
+    pub(crate) fn try_send(&self, handle: ConnHandle, pdu: Pdu<P::Packet>) -> Result<(), Error> {
+        let index = self.get_or_create_channel_index(handle)?;
+
+        let mut state = self.state.borrow_mut();
+        let result = if let Some(ref channel) = state.channels[index as usize] {
+            channel.try_send(pdu).map_err(|_| Error::OutOfMemory)
+        } else {
+            Err(Error::InvalidState)
+        };
+
+        // If send was successful, wake up any waiting receive operations
+        if result.is_ok() {
+            state.waker.wake();
+        }
+
+        result
+    }
+
+    /// Remove the channel for a disconnected handle
+    pub(crate) fn remove_handle(&self, handle: ConnHandle) {
+        let mut state = self.state.borrow_mut();
+        if let Some(index) = state.handle_to_index.remove(&handle) {
+            state.channels[index as usize] = None;
         }
     }
 }

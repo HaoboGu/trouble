@@ -30,8 +30,6 @@ use bt_hci::{ControllerToHostPacket, FromHciBytes, WriteHci};
 use embassy_futures::select::{select3, select4, Either3, Either4};
 use embassy_sync::once_lock::OnceLock;
 use embassy_sync::waitqueue::WakerRegistration;
-#[cfg(feature = "gatt")]
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel};
 use embassy_time::Duration;
 use futures::pin_mut;
 
@@ -41,6 +39,8 @@ use crate::command::CommandState;
 use crate::connection::ConnectionEvent;
 use crate::connection_manager::{ConnectionManager, ConnectionStorage, PacketGrant};
 use crate::cursor::WriteCursor;
+#[cfg(feature = "gatt")]
+use crate::gatt::GattClientManager;
 use crate::pdu::Pdu;
 #[cfg(feature = "security")]
 use crate::security_manager::SecurityEventData;
@@ -65,7 +65,7 @@ pub(crate) struct BleHost<'d, T, P: PacketPool> {
     pub(crate) connections: ConnectionManager<'d, P>,
     pub(crate) channels: ChannelManager<'d, P>,
     #[cfg(feature = "gatt")]
-    pub(crate) att_client: Channel<NoopRawMutex, (ConnHandle, Pdu<P::Packet>), { crate::config::L2CAP_RX_QUEUE_SIZE }>,
+    pub(crate) gatt_client_manager: GattClientManager<P>,
     pub(crate) advertise_state: AdvState<'d>,
     pub(crate) advertise_command_state: CommandState<bool>,
     pub(crate) connect_command_state: CommandState<bool>,
@@ -205,7 +205,7 @@ where
             connections: ConnectionManager::new(connections, P::MTU as u16 - 4),
             channels: ChannelManager::new(channels),
             #[cfg(feature = "gatt")]
-            att_client: Channel::new(),
+            gatt_client_manager: GattClientManager::new(),
             advertise_state: AdvState::new(advertise_handles),
             advertise_command_state: CommandState::new(),
             scan_command_state: CommandState::new(),
@@ -457,7 +457,7 @@ where
                             self.connections.post_gatt(acl.handle(), pdu)?;
                         }
                         Ok(att::Att::Server(_)) => {
-                            if let Err(e) = self.att_client.try_send((acl.handle(), pdu)) {
+                            if let Err(e) = self.gatt_client_manager.try_send(acl.handle(), pdu) {
                                 return Err(Error::OutOfMemory);
                             }
                         }
@@ -883,6 +883,8 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                             .unwrap_or(Status::UNSPECIFIED);
                             let _ = host.connections.disconnected(handle, reason);
                             let _ = host.channels.disconnected(handle);
+                            #[cfg(feature = "gatt")]
+                            host.gatt_client_manager.remove_handle(handle);
                             let mut m = host.metrics.borrow_mut();
                             m.disconnect_events = m.disconnect_events.wrapping_add(1);
                         }

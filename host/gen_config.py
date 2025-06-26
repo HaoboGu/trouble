@@ -58,6 +58,9 @@ feature("gatt_client_notification_max_subscribers",
 feature("gatt_client_notification_queue_size",
         "When using the GATT client, this controls how many notifications can be queued for each subscriber.",
         default=1, min=1, max=512, pow2=True)
+feature("gatt_client_max_connections",
+        "When using the GATT client, this controls the maximum number of simultaneous connections that can have active GATT clients.",
+        default=4, min=1, max=32, pow2=True)
 
 # ========= Update Cargo.toml
 

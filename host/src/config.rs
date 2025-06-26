@@ -71,3 +71,10 @@ pub const GATT_CLIENT_NOTIFICATION_MAX_SUBSCRIBERS: usize = raw::GATT_CLIENT_NOT
 ///
 /// Default: 1.
 pub const GATT_CLIENT_NOTIFICATION_QUEUE_SIZE: usize = raw::GATT_CLIENT_NOTIFICATION_QUEUE_SIZE;
+
+/// GATT client max connections
+///
+/// This defines the maximum number of simultaneous connections that can have active GATT clients.
+///
+/// Default: 4.
+pub const GATT_CLIENT_MAX_CONNECTIONS: usize = raw::GATT_CLIENT_MAX_CONNECTIONS;
