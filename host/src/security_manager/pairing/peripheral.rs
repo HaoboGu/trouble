@@ -3,8 +3,11 @@ use core::ops::{Deref, DerefMut};
 
 use embassy_time::Instant;
 use rand::Rng;
+use bt_hci::param::AddrKind;
+use bt_hci::param::BdAddr;
 use rand_core::{CryptoRng, RngCore};
 
+use crate::IdentityResolvingKey;
 use crate::codec::{Decode, Encode};
 use crate::connection::SecurityLevel;
 use crate::prelude::ConnectionEvent;
@@ -353,6 +356,10 @@ impl Pairing {
 
                 (x, Command::KeypressNotification) => x,
 
+                (_, Command::IdentityInformation) => todo!("IdentityInformation"),
+
+                (_, Command::IdentityAddressInformation) => todo!("IdentityAddressInformation"),
+
                 _ => return Err(Error::InvalidState),
             }
         };
@@ -402,6 +409,46 @@ impl Pairing {
             }
         }
 
+        Ok(())
+    }
+
+    fn handle_identity_information(payload: &[u8], pairing_data: &mut PairingData) -> Result<(), Error> {
+        let irk = IdentityResolvingKey::new(u128::from_le_bytes(
+            payload.try_into().map_err(|_| Error::InvalidValue)?,
+        ));
+        if let Some(ref mut bond) = &mut pairing_data.bond_information {
+            bond.identity.irk = Some(irk);
+        }
+
+        // TODO:
+        // let bond_info = self.store_pairing()?;
+        // self.try_send_event(SecurityEventData::EnableEncryption(handle, bond_info))?;
+        debug!("Identity information: IRK: {:?}", irk);
+        Ok(())
+    }
+
+    fn handle_identity_address_information(payload: &[u8], pairing_data: &mut PairingData) -> Result<(), Error> {
+        let addr_type = payload[0];
+        let kind = if addr_type == 0 {
+            AddrKind::PUBLIC
+        } else if addr_type == 1 {
+            AddrKind::RANDOM
+        } else {
+            // Impossible
+            error!("[security manager] Invalid address type: {:?}", addr_type);
+            return Err(Error::InvalidValue);
+        };
+        let addr = BdAddr::new(payload[1..7].try_into().map_err(|_| Error::InvalidValue)?);
+        pairing_data.peer_address = Address { kind, addr };
+        // TODO: Check if the bond info is correctly updated
+        // let bond_info = self.store_pairing()?;
+        // How to process the public device address when ​​Resolvable Private Address is used?
+        // TODO: If bond info is updated, send EnableEncryption event
+        // self.try_send_event(SecurityEventData::EnableEncryption(handle, bond_info))?;
+        debug!(
+            "Identity address information: addr_type: {:?}, addr: {:?}",
+            addr_type, addr
+        );
         Ok(())
     }
 
