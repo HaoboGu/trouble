@@ -924,7 +924,6 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                         // Send disconnect event to the controller
                         host.command(Disconnect::new(handle, DisconnectReason::AuthenticationFailure))
                             .await?;
-                        unwrap!(self.disconnected(handle, Status::AUTHENTICATION_FAILURE));
                     }
                 } else {
                     warn!("[host] Long term key request reply failed, unknown peer")
