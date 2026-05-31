@@ -230,7 +230,12 @@ impl Inner {
                 addr: rpa,
             });
         }
-        self.state.local_address.ok_or(Error::InvalidValue)
+        // No local RPA: per-connection identity overrides the global one.
+        storage
+            .local_identity
+            .override_address()
+            .or(self.state.local_address)
+            .ok_or(Error::InvalidValue)
     }
 
     /// Get the peer address to use for pairing calculations.
@@ -1280,6 +1285,12 @@ impl<'sm, 'cm, 'cm2, 'cs, P: PacketPool> PairingOps<P> for PairingOpsImpl<'sm, '
     }
 
     fn local_identity_address(&self) -> Result<Address, Error> {
-        self.state.local_address.ok_or(Error::InvalidValue)
+        // The per-set identity when set, else the global one (validated static-random at advertise time).
+        self.storage
+            .local_identity
+            .override_address()
+            .or(self.state.local_address)
+            .ok_or(Error::InvalidValue)
     }
 }
+

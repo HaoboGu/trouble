@@ -438,6 +438,8 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
             params,
             #[cfg(feature = "security")]
             ResolvablePrivateAddrs::none(),
+            #[cfg(feature = "security")]
+            LocalIdentity::Global,
         )
     }
 
@@ -448,6 +450,8 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
         role: LeConnRole,
         params: ConnParams,
         #[cfg(feature = "security")] resolvable_addrs: ResolvablePrivateAddrs,
+        // Resolved at Connection Complete, or `Pending` until the Set Terminated event.
+        #[cfg(feature = "security")] local_identity: LocalIdentity,
     ) -> Result<(), Error> {
         let mut state = self.state.borrow_mut();
         let default_credits = state.default_link_credits;
@@ -480,6 +484,8 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 #[cfg(feature = "security")]
                 {
                     storage.resolvable_addrs = resolvable_addrs;
+                    // `Pending` here is withheld by `poll_accept` until the Set Terminated handler binds it.
+                    storage.local_identity = local_identity;
                 }
 
                 match role {
@@ -517,6 +523,12 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
         core::mem::drop(state);
         for (idx, storage) in self.connections.borrow_mut().iter_mut().enumerate() {
             if let ConnectionState::Connecting = storage.state {
+                // Withhold a connection whose per-set identity isn't bound yet, so it can't be
+                // accepted (and paired) under the wrong address.
+                #[cfg(feature = "security")]
+                if storage.local_identity.is_pending() {
+                    continue;
+                }
                 let handle = storage.handle.unwrap();
                 let r = storage.role.unwrap();
                 if r == role {
@@ -564,6 +576,29 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
 
     pub(crate) async fn accept(&'d self, role: LeConnRole, peers: &[Address]) -> Connection<'d, P> {
         poll_fn(|cx| self.poll_accept(role, peers, Some(cx))).await
+    }
+
+    /// Wake `poll_accept` after a deferred connection's identity is resolved.
+    #[cfg(feature = "security")]
+    pub(crate) fn wake_peripheral_acceptor(&self) {
+        self.state.borrow_mut().peripheral_waker.wake();
+    }
+
+    /// Release any still-`Pending` connection to the global address. Called on host-disable, which
+    /// emits no `LE Advertising Set Terminated` event (Core spec Vol 4 Part E §7.7.65.18), so the
+    /// connection would otherwise never be released; the producing set is no longer identifiable.
+    #[cfg(feature = "security")]
+    pub(crate) fn resolve_pending_local_identities(&self) {
+        let mut released = false;
+        for storage in self.connections.borrow_mut().iter_mut() {
+            if storage.state == ConnectionState::Connecting && storage.local_identity.is_pending() {
+                storage.local_identity = LocalIdentity::Global;
+                released = true;
+            }
+        }
+        if released {
+            self.wake_peripheral_acceptor();
+        }
     }
 
     pub(crate) fn set_link_credits(&self, credits: usize) {
@@ -1072,6 +1107,46 @@ impl<P> DisconnectRequest<'_, P> {
         storage.state = ConnectionState::Disconnecting(self.reason);
     }
 }
+
+/// SMP local identity bound to a connection, overriding the host-global address. A per-set
+/// connection starts `Pending` (Connection Complete carries no advertising handle) until the
+/// `LE Advertising Set Terminated` event binds it (Core spec Vol 4 Part E §7.8.56).
+#[cfg(feature = "security")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalIdentity {
+    /// Host-global identity (legacy, no per-set address, or central).
+    Global,
+    /// A per-set identity bound to this connection.
+    Override(Address),
+    /// Awaiting the `LE Advertising Set Terminated` event.
+    Pending,
+}
+
+#[cfg(feature = "security")]
+impl LocalIdentity {
+    /// `Some` → `Override`, `None` → `Global`.
+    pub(crate) fn resolved(override_addr: Option<Address>) -> Self {
+        match override_addr {
+            Some(addr) => LocalIdentity::Override(addr),
+            None => LocalIdentity::Global,
+        }
+    }
+
+    /// The override address, if any; `None` uses the global. (`Pending` never reaches SMP —
+    /// pending connections aren't accepted.)
+    pub(crate) fn override_address(self) -> Option<Address> {
+        match self {
+            LocalIdentity::Override(addr) => Some(addr),
+            LocalIdentity::Global | LocalIdentity::Pending => None,
+        }
+    }
+
+    /// Whether to withhold the connection from `poll_accept` until bound.
+    pub(crate) fn is_pending(self) -> bool {
+        matches!(self, LocalIdentity::Pending)
+    }
+}
+
 pub struct ConnectionStorage<P> {
     pub state: ConnectionState,
     pub handle: Option<ConnHandle>,
@@ -1096,6 +1171,9 @@ pub struct ConnectionStorage<P> {
     pub smp_timeout: bool,
     #[cfg(feature = "security")]
     pub resolvable_addrs: ResolvablePrivateAddrs,
+    /// SMP local identity for this connection, overriding the host-global address. See [`LocalIdentity`].
+    #[cfg(feature = "security")]
+    pub local_identity: LocalIdentity,
     #[cfg(feature = "legacy-pairing")]
     pub encryption_key_len: u8,
     pub l2cap_listening: bool,
@@ -1195,6 +1273,8 @@ impl<P> ConnectionStorage<P> {
             smp_timeout: false,
             #[cfg(feature = "security")]
             resolvable_addrs: ResolvablePrivateAddrs::none(),
+            #[cfg(feature = "security")]
+            local_identity: LocalIdentity::Global,
             #[cfg(feature = "legacy-pairing")]
             encryption_key_len: 0,
             l2cap_listening: false,
@@ -1685,5 +1765,137 @@ pub(crate) mod tests {
         handle.disconnect();
 
         assert!(!mgr.is_handle_connected(ConnHandle::new(3)));
+    }
+
+    #[cfg(feature = "security")]
+    fn local_identity_of(mgr: &ConnectionManager<'_, DefaultPacketPool>, handle: ConnHandle) -> LocalIdentity {
+        unwrap!(mgr.with_connected_handle(handle, |storage| Ok(storage.local_identity)))
+    }
+
+    // `with_connected_handle` mutates an established connection's storage and reports that it found
+    // the slot. (Exercises the generic helper the terminated-event handler uses, not that handler.)
+    #[cfg(feature = "security")]
+    #[test]
+    fn with_connected_handle_stamps_established_connection() {
+        let mgr = setup();
+        let identity = Address::new(AddrKind::RANDOM, BdAddr::new(ADDR_1));
+
+        unwrap!(mgr.connect(
+            ConnHandle::new(0),
+            Address::new(AddrKind::RANDOM, BdAddr::new(ADDR_2)),
+            LeConnRole::Peripheral,
+            ConnParams::new(),
+        ));
+
+        assert!(mgr
+            .with_connected_handle(ConnHandle::new(0), |storage| {
+                storage.local_identity = LocalIdentity::Override(identity);
+                Ok(())
+            })
+            .is_ok());
+        assert_eq!(local_identity_of(mgr, ConnHandle::new(0)), LocalIdentity::Override(identity));
+    }
+
+    // No slot for the handle (e.g. `Connection Complete` not processed): the helper returns an
+    // error, which the terminated-event handler turns into the global-address warning.
+    #[cfg(feature = "security")]
+    #[test]
+    fn with_connected_handle_reports_missing_connection() {
+        let mgr = setup();
+        let identity = Address::new(AddrKind::RANDOM, BdAddr::new(ADDR_1));
+
+        assert!(mgr
+            .with_connected_handle(ConnHandle::new(7), |storage| {
+                storage.local_identity = LocalIdentity::Override(identity);
+                Ok(())
+            })
+            .is_err());
+    }
+
+    // Eager path: a resolved identity makes the connection acceptable immediately (no deferral).
+    #[cfg(feature = "security")]
+    #[test]
+    fn connect_with_rpas_eager_binds_local_identity() {
+        let mgr = setup();
+        let identity = Address::new(AddrKind::RANDOM, BdAddr::new(ADDR_1));
+
+        unwrap!(mgr.connect_with_rpas(
+            ConnHandle::new(0),
+            Address::new(AddrKind::RANDOM, BdAddr::new(ADDR_2)),
+            LeConnRole::Peripheral,
+            ConnParams::new(),
+            ResolvablePrivateAddrs::none(),
+            LocalIdentity::Override(identity),
+        ));
+
+        assert_eq!(local_identity_of(mgr, ConnHandle::new(0)), LocalIdentity::Override(identity));
+        assert!(mgr.poll_accept(LeConnRole::Peripheral, &[], None).is_ready());
+    }
+
+    // Deferred path: a `Pending` connection is withheld from `poll_accept` until the terminated
+    // event binds its identity, after which it is delivered carrying that identity.
+    #[cfg(feature = "security")]
+    #[test]
+    fn connect_with_rpas_defers_until_identity() {
+        let mgr = setup();
+        let identity = Address::new(AddrKind::RANDOM, BdAddr::new(ADDR_1));
+
+        unwrap!(mgr.connect_with_rpas(
+            ConnHandle::new(0),
+            Address::new(AddrKind::RANDOM, BdAddr::new(ADDR_2)),
+            LeConnRole::Peripheral,
+            ConnParams::new(),
+            ResolvablePrivateAddrs::none(),
+            LocalIdentity::Pending,
+        ));
+
+        // Withheld while pending its identity.
+        assert!(mgr.poll_accept(LeConnRole::Peripheral, &[], None).is_pending());
+
+        // The terminated-event handler binds the identity, releasing the connection.
+        unwrap!(mgr.with_connected_handle(ConnHandle::new(0), |storage| {
+            if storage.local_identity.is_pending() {
+                storage.local_identity = LocalIdentity::Override(identity);
+            }
+            Ok(())
+        }));
+
+        // Now delivered, carrying the bound identity. Hold the connection alive so its storage
+        // slot is not recycled before the assertion below.
+        let conn = match mgr.poll_accept(LeConnRole::Peripheral, &[], None) {
+            Poll::Ready(conn) => conn,
+            Poll::Pending => panic!("connection should be released once its identity is bound"),
+        };
+        assert_eq!(local_identity_of(mgr, ConnHandle::new(0)), LocalIdentity::Override(identity));
+        drop(conn);
+    }
+
+    // Fallback: when advertising is disabled, a still-`Pending` connection is resolved to the
+    // global address and released (Core spec Vol 4 Part E §7.7.65.18: no Set Terminated event is
+    // generated for a host-disabled set, so the connection must not be stranded).
+    #[cfg(feature = "security")]
+    #[test]
+    fn resolve_pending_local_identities_releases_to_global() {
+        let mgr = setup();
+
+        unwrap!(mgr.connect_with_rpas(
+            ConnHandle::new(0),
+            Address::new(AddrKind::RANDOM, BdAddr::new(ADDR_2)),
+            LeConnRole::Peripheral,
+            ConnParams::new(),
+            ResolvablePrivateAddrs::none(),
+            LocalIdentity::Pending,
+        ));
+
+        assert!(mgr.poll_accept(LeConnRole::Peripheral, &[], None).is_pending());
+
+        mgr.resolve_pending_local_identities();
+
+        let conn = match mgr.poll_accept(LeConnRole::Peripheral, &[], None) {
+            Poll::Ready(conn) => conn,
+            Poll::Pending => panic!("connection should be released by the host-disable fallback"),
+        };
+        assert_eq!(local_identity_of(mgr, ConnHandle::new(0)), LocalIdentity::Global);
+        drop(conn);
     }
 }

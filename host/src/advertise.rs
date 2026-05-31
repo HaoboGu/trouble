@@ -65,6 +65,20 @@ impl<'d> AdvertisementSet<'d> {
         }
         ret
     }
+
+    /// The per-set address used as this connection's SMP Identity Address. `Some` only for a
+    /// connectable set with a random own-address kind and a per-set address override; `None`
+    /// otherwise (the host default is used).
+    #[cfg(feature = "security")]
+    pub(crate) fn local_identity_address(&self, own_addr_kind: AddrKind) -> Option<Address> {
+        let binds = matches!(
+            own_addr_kind,
+            AddrKind::RANDOM | AddrKind::RESOLVABLE_PRIVATE_OR_RANDOM
+        );
+        self.address
+            .filter(|_| self.data.is_connectable() && binds)
+            .map(|addr| Address::new(AddrKind::RANDOM, addr))
+    }
 }
 
 /// Parameters for an advertisement.
@@ -223,6 +237,19 @@ pub enum Advertisement<'d> {
 }
 
 impl<'d> Advertisement<'d> {
+    /// Whether this advertisement is connectable (mirrors `props.connectable_adv()`).
+    #[cfg(feature = "security")]
+    pub(crate) fn is_connectable(&self) -> bool {
+        matches!(
+            self,
+            Advertisement::ConnectableScannableUndirected { .. }
+                | Advertisement::ConnectableNonscannableDirected { .. }
+                | Advertisement::ConnectableNonscannableDirectedHighDuty { .. }
+                | Advertisement::ExtConnectableNonscannableUndirected { .. }
+                | Advertisement::ExtConnectableNonscannableDirected { .. }
+        )
+    }
+
     pub(crate) fn is_valid(&self) -> bool {
         match self {
             Advertisement::ConnectableScannableUndirected { adv_data, .. }
@@ -692,5 +719,22 @@ mod tests {
             &mut adv_data[..],
         )
         .is_err());
+    }
+
+    #[cfg(feature = "security")]
+    #[test]
+    fn static_random_address_detection() {
+        let addr = |bytes| Address::new(AddrKind::RANDOM, BdAddr::new(bytes));
+        // Static random: the top two bits of the most-significant byte (index 5) are 0b11.
+        assert!(addr([0x00, 0x00, 0x00, 0x00, 0x00, 0xC0]).is_static_random());
+        assert!(addr([0x01, 0x02, 0x03, 0x04, 0x05, 0xFF]).is_static_random());
+        // Non-resolvable private (0b00), resolvable private (0b01) and the reserved 0b10
+        // prefix are all rejected.
+        assert!(!addr([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]).is_static_random());
+        assert!(!addr([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x40]).is_static_random());
+        assert!(!addr([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x80]).is_static_random());
+        // The check must look at the MSB (index 5), not the LSB (index 0): a 0xC0 in the
+        // least-significant byte must NOT pass.
+        assert!(!addr([0xC0, 0x00, 0x00, 0x00, 0x00, 0x00]).is_static_random());
     }
 }
