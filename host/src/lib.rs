@@ -170,6 +170,12 @@ impl Address {
         }
     }
 
+    /// Whether this is a Static Random address (top two bits of the MSB are `0b11`).
+    #[cfg(feature = "security")]
+    pub(crate) fn is_static_random(&self) -> bool {
+        self.addr.raw()[5] & 0xC0 == 0xC0
+    }
+
     /// To bytes
     pub fn to_bytes(&self) -> [u8; 7] {
         let mut bytes = [0; 7];

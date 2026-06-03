@@ -39,7 +39,7 @@ use bt_hci::event::{DisconnectionComplete, EventKind, NumberOfCompletedPackets, 
 #[cfg(feature = "security")]
 use bt_hci::param::BdAddr;
 use bt_hci::param::{
-    AddrKind, AdvHandle, AdvSet, ConnHandle, DisconnectReason, EventMask, EventMaskPage2, FilterDuplicates, LeConnRole,
+    AddrKind, AdvHandle, ConnHandle, DisconnectReason, EventMask, EventMaskPage2, FilterDuplicates, LeConnRole,
     LeEventMask, Status,
 };
 use bt_hci::{ControllerToHostPacket, FromHciBytes, WriteHci};
@@ -53,6 +53,8 @@ use crate::att::{AttClient, AttServer};
 use crate::channel_manager::{ChannelManager, ChannelStorage};
 use crate::command::CommandState;
 use crate::connection::{ConnParams, ConnectionEvent};
+#[cfg(feature = "security")]
+use crate::connection_manager::LocalIdentity;
 #[cfg(feature = "security")]
 use crate::connection_manager::ResolvablePrivateAddrs;
 use crate::connection_manager::{ConnectionManager, ConnectionStorage, PacketGrant};
@@ -147,7 +149,9 @@ pub(crate) struct InitialState {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AdvHandleState {
     None,
-    Advertising(AdvHandle),
+    /// Under `security`, carries the set's per-set identity (a static random address), used to
+    /// stamp the connection it produces when the `LE Advertising Set Terminated` event arrives.
+    Advertising(AdvHandle, #[cfg(feature = "security")] Option<Address>),
     Terminated(AdvHandle),
 }
 
@@ -171,33 +175,58 @@ impl<'d> AdvState<'d> {
         self.waker.borrow_mut().wake();
     }
 
-    // Terminate handle
+    /// Mark the set under `handle` as terminated. Read [`Self::local_identity_address`] first if
+    /// needed — it is gone once terminated.
     pub(crate) fn terminate(&self, handle: AdvHandle) {
         for entry in self.handles.borrow_mut().iter_mut() {
-            match entry {
-                AdvHandleState::Advertising(h) if *h == handle => {
-                    *entry = AdvHandleState::Terminated(handle);
-                }
-                _ => {}
+            if matches!(entry, AdvHandleState::Advertising(h, ..) if *h == handle) {
+                *entry = AdvHandleState::Terminated(handle);
             }
         }
         self.waker.borrow_mut().wake();
+    }
+
+    /// The per-set identity the set under `handle` was configured with, if any.
+    #[cfg(feature = "security")]
+    pub(crate) fn local_identity_address(&self, handle: AdvHandle) -> Option<Address> {
+        for entry in self.handles.borrow().iter() {
+            if let AdvHandleState::Advertising(h, local_identity) = entry {
+                if *h == handle {
+                    return *local_identity;
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether any advertising set carries a per-set identity. If so a new peripheral connection is
+    /// deferred (`Pending`) until the Set Terminated event names its producing set; otherwise every
+    /// set uses the global address and it binds eagerly.
+    #[cfg(feature = "security")]
+    pub(crate) fn has_per_set_identity(&self) -> bool {
+        self.handles
+            .borrow()
+            .iter()
+            .any(|entry| matches!(entry, AdvHandleState::Advertising(_, Some(_))))
     }
 
     pub(crate) fn len(&self) -> usize {
         self.handles.as_ptr().len()
     }
 
-    pub(crate) fn start(&self, sets: &[AdvSet]) {
-        assert!(sets.len() <= self.handles.as_ptr().len());
-        let mut handles = self.handles.borrow_mut();
-        for handle in handles.iter_mut() {
-            *handle = AdvHandleState::None;
-        }
-
-        for (idx, entry) in sets.iter().enumerate() {
-            handles[idx] = AdvHandleState::Advertising(entry.adv_handle);
-        }
+    /// Mark the set at `index` as advertising under `handle`, with its per-set `local_identity`.
+    /// Callers clear stale state first via [`Self::reset`].
+    pub(crate) fn mark_advertising(
+        &self,
+        index: usize,
+        handle: AdvHandle,
+        #[cfg(feature = "security")] local_identity: Option<Address>,
+    ) {
+        self.handles.borrow_mut()[index] = AdvHandleState::Advertising(
+            handle,
+            #[cfg(feature = "security")]
+            local_identity,
+        );
     }
 
     pub async fn wait(&self) {
@@ -504,6 +533,13 @@ where
     ) -> bool {
         match status.to_result() {
             Ok(_) => {
+                // Defer a peripheral connection to a per-set identity (`Pending`) until the Set
+                // Terminated event names its set; central and global-address connections bind now.
+                #[cfg(feature = "security")]
+                let local_identity = match role {
+                    LeConnRole::Peripheral if self.advertise_state.has_per_set_identity() => LocalIdentity::Pending,
+                    _ => LocalIdentity::Global,
+                };
                 if let Err(err) = self.connections.connect_with_rpas(
                     handle,
                     peer_addr,
@@ -511,6 +547,8 @@ where
                     params,
                     #[cfg(feature = "security")]
                     resolvable_addrs,
+                    #[cfg(feature = "security")]
+                    local_identity,
                 ) {
                     warn!("Error establishing connection: {:?}", err);
                     return false;
@@ -1231,7 +1269,28 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                 LeEventKind::LeScanTimeout => {}
                                 LeEventKind::LeAdvertisingSetTerminated => {
                                     let set = unwrap!(LeAdvertisingSetTerminated::from_hci_bytes_complete(event.data));
+                                    // Read the set's identity before `terminate` drops it.
+                                    #[cfg(feature = "security")]
+                                    let local_identity = host.advertise_state.local_identity_address(set.adv_handle);
                                     host.advertise_state.terminate(set.adv_handle);
+                                    // `set.handle` is valid only on a success (0x00) termination — the spec
+                                    // emits Connection Complete before this event (§7.8.56, §7.7.65.18). Bind
+                                    // the now-known identity, but only onto a still-`Pending` slot so a
+                                    // re-armed handle can't overwrite a live connection; then wake.
+                                    #[cfg(feature = "security")]
+                                    if set.status.to_result().is_ok()
+                                        && host
+                                            .connections
+                                            .with_connected_handle(set.handle, |storage| {
+                                                if storage.local_identity.is_pending() {
+                                                    storage.local_identity = LocalIdentity::resolved(local_identity);
+                                                }
+                                                Ok(())
+                                            })
+                                            .is_ok()
+                                    {
+                                        host.connections.wake_peripheral_acceptor();
+                                    }
                                 }
                                 LeEventKind::LeExtendedAdvertisingReport => {
                                     #[cfg(feature = "scan")]
@@ -1630,6 +1689,12 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                         } else {
                             host.command(LeSetAdvEnable::new(false)).await?
                         }
+                        // Host-disable emits no Set Terminated event (§7.7.65.18), so release any
+                        // `Pending` connection before clearing the per-set state below.
+                        #[cfg(feature = "security")]
+                        host.connections.resolve_pending_local_identities();
+                        // Clear stale `Advertising` slots from a cancelled/failed advertise.
+                        host.advertise_state.reset();
                         host.advertise_command_state.canceled();
                     }
                     CancelledCommandState::Scan(ext) => {
@@ -1772,5 +1837,101 @@ impl<F: FnOnce()> OnDrop<F> {
 impl<F: FnOnce()> Drop for OnDrop<F> {
     fn drop(&mut self) {
         unsafe { self.f.as_ptr().read()() }
+    }
+}
+
+#[cfg(all(test, feature = "security"))]
+mod adv_state_tests {
+    use bt_hci::param::{AddrKind, BdAddr};
+
+    use super::*;
+
+    fn addr(b: u8) -> Address {
+        Address::new(AddrKind::RANDOM, BdAddr::new([b; 6]))
+    }
+
+    // `mark_advertising()` records the set's local identity address, exposed via
+    // `local_identity_address()`; `terminate()` transitions the lifecycle and it is no longer available.
+    #[test]
+    fn mark_advertising_records_local_identity() {
+        let handles = RefCell::new([AdvHandleState::None]);
+        let state = AdvState::new(&handles);
+        let local_identity = addr(1);
+
+        state.mark_advertising(0, AdvHandle::new(0), Some(local_identity));
+        assert_eq!(state.local_identity_address(AdvHandle::new(0)), Some(local_identity));
+
+        state.terminate(AdvHandle::new(0));
+        assert!(matches!(handles.borrow()[0], AdvHandleState::Terminated(_)));
+        // No longer advertising → no identity.
+        assert_eq!(state.local_identity_address(AdvHandle::new(0)), None);
+    }
+
+    // A set advertising without a per-set identity, or an unknown handle, yields nothing.
+    #[test]
+    fn local_identity_address_none_without_per_set_identity() {
+        let handles = RefCell::new([AdvHandleState::Advertising(AdvHandle::new(0), None)]);
+        let state = AdvState::new(&handles);
+
+        assert_eq!(state.local_identity_address(AdvHandle::new(0)), None);
+        assert_eq!(state.local_identity_address(AdvHandle::new(1)), None);
+    }
+
+    // Any advertising set carrying a per-set identity defers the connection (single or multi-set,
+    // homogeneous or differing — the producing set is resolved later by the Terminated event).
+    #[test]
+    fn has_per_set_identity_true_when_any_set_has_identity() {
+        let single = RefCell::new([AdvHandleState::Advertising(AdvHandle::new(0), Some(addr(1)))]);
+        assert!(AdvState::new(&single).has_per_set_identity());
+
+        let differing = RefCell::new([
+            AdvHandleState::Advertising(AdvHandle::new(0), Some(addr(1))),
+            AdvHandleState::Advertising(AdvHandle::new(1), Some(addr(2))),
+        ]);
+        assert!(AdvState::new(&differing).has_per_set_identity());
+    }
+
+    // A per-set identity mixed with a global-address set (e.g. a connectable identity set + a
+    // non-connectable beacon) still defers — and resolves correctly via the Terminated event —
+    // rather than the old false "ambiguous" classification.
+    #[test]
+    fn has_per_set_identity_true_when_mixed_with_global() {
+        let some_then_none = RefCell::new([
+            AdvHandleState::Advertising(AdvHandle::new(0), Some(addr(1))),
+            AdvHandleState::Advertising(AdvHandle::new(1), None),
+        ]);
+        assert!(AdvState::new(&some_then_none).has_per_set_identity());
+        // Order-independent.
+        let none_then_some = RefCell::new([
+            AdvHandleState::Advertising(AdvHandle::new(0), None),
+            AdvHandleState::Advertising(AdvHandle::new(1), Some(addr(1))),
+        ]);
+        assert!(AdvState::new(&none_then_some).has_per_set_identity());
+    }
+
+    // All-global advertising and the no-active-set case bind eagerly (no per-set identity).
+    #[test]
+    fn has_per_set_identity_false_when_all_global() {
+        let all_global = RefCell::new([
+            AdvHandleState::Advertising(AdvHandle::new(0), None),
+            AdvHandleState::Advertising(AdvHandle::new(1), None),
+        ]);
+        assert!(!AdvState::new(&all_global).has_per_set_identity());
+
+        let none = RefCell::new([AdvHandleState::None]);
+        assert!(!AdvState::new(&none).has_per_set_identity());
+    }
+
+    // Terminated/None slots are ignored; only live advertising sets count.
+    #[test]
+    fn has_per_set_identity_ignores_terminated_slots() {
+        let terminated_only = RefCell::new([AdvHandleState::Terminated(AdvHandle::new(0))]);
+        assert!(!AdvState::new(&terminated_only).has_per_set_identity());
+
+        let terminated_plus_live = RefCell::new([
+            AdvHandleState::Terminated(AdvHandle::new(0)),
+            AdvHandleState::Advertising(AdvHandle::new(1), Some(addr(3))),
+        ]);
+        assert!(AdvState::new(&terminated_plus_live).has_per_set_identity());
     }
 }

@@ -113,14 +113,14 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
             host.command(LeSetScanResponseData::new(to_copy as u8, buf)).await?;
         }
 
-        let advset: [AdvSet; 1] = [AdvSet {
-            adv_handle: AdvHandle::new(0),
-            duration: bt_hci_duration(params.timeout.unwrap_or(embassy_time::Duration::from_micros(0))),
-            max_ext_adv_events: 0,
-        }];
-
         trace!("[host] enabling advertising");
-        host.advertise_state.start(&advset[..]);
+        // Legacy advertising uses the host-global address (no per-set identity).
+        host.advertise_state.mark_advertising(
+            0,
+            AdvHandle::new(0),
+            #[cfg(feature = "security")]
+            None,
+        );
         host.command(LeSetAdvEnable::new(true)).await?;
         drop.defuse();
         Ok(Advertiser {
@@ -194,6 +194,20 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
         for set in sets.iter() {
             if !set.data.is_valid() {
                 return Err(BleHostError::BleHost(Error::InvalidValue));
+            }
+            // A per-set address is distributed as the SMP Identity Address, which must be Static
+            // Random (Core spec Vol 3 Part H §3.6.5).
+            #[cfg(feature = "security")]
+            {
+                let own_addr_kind = set.params.own_addr_kind.unwrap_or_else(|| host.own_addr_kind());
+                if let Some(addr) = set.local_identity_address(own_addr_kind) {
+                    if !addr.is_static_random() {
+                        warn!(
+                            "[host] per-set address bound to a connectable set must be a static random address (it is distributed as the SMP identity)"
+                        );
+                        return Err(BleHostError::BleHost(Error::InvalidValue));
+                    }
+                }
             }
         }
 
@@ -271,12 +285,20 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
             handles[i].adv_handle = handle;
             handles[i].duration = bt_hci_duration(set.params.timeout.unwrap_or(embassy_time::Duration::from_micros(0)));
             handles[i].max_ext_adv_events = set.params.max_events.unwrap_or(0);
+
+            // Record this set's per-set identity for the connection it produces.
+            host.advertise_state.mark_advertising(
+                i,
+                handle,
+                #[cfg(feature = "security")]
+                set.local_identity_address(own_addr_kind),
+            );
         }
 
         trace!("[host] enabling extended advertising");
-        host.advertise_state.start(handles);
         host.command(LeSetExtAdvEnable::new(true, handles)).await?;
         drop.defuse();
+
         Ok(Advertiser {
             host: self.host,
             extended: true,
@@ -358,6 +380,7 @@ impl<'d, C: Controller, P: PacketPool> Advertiser<'d, C, P> {
         )
         .await
         {
+            // Identity is bound from the Set Terminated event (in `host.rs`), not here.
             Either::First(conn) => Ok(conn),
             Either::Second(_) => Err(Error::Timeout),
         };
