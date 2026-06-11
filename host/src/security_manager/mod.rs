@@ -411,6 +411,15 @@ impl Inner {
             .handle_l2cap_command(command, payload, &mut ops, &mut self.rng)
     }
 
+    /// True if the in-flight pairing belongs to this connection's peer.
+    /// Events from other connections must not reach the SM: they would
+    /// transition it to `Error` and abort an unrelated pairing (issue #603).
+    fn sm_owns_connection<P>(sm: &Pairing, storage: &ConnectionStorage<P>) -> bool {
+        storage.peer_identity.as_ref().is_some_and(|identity| {
+            sm.result().is_none() && sm.peer_address() == Self::connection_peer_address(identity.addr, storage)
+        })
+    }
+
     fn handle_pairing_event<P: PacketPool>(
         &mut self,
         bonds: &mut VecView<BondInformation>,
@@ -419,7 +428,7 @@ impl Inner {
         connections: &ConnectionManager<'_, P>,
         storage: &ConnectionStorage<P::Packet>,
     ) -> Result<(), Error> {
-        if let Some(sm) = self.pairing_sm.as_mut() {
+        if let Some(sm) = self.pairing_sm.as_mut().filter(|sm| Self::sm_owns_connection(sm, storage)) {
             let mut ops = PairingOpsImpl {
                 bonds,
                 events,
@@ -449,7 +458,9 @@ impl Inner {
         connections: &ConnectionManager<'_, P>,
         storage: &mut ConnectionStorage<P::Packet>,
     ) -> Result<(), Error> {
-        let res: Result<(), Error> = if let Some(sm) = self.pairing_sm.as_mut() {
+        let res: Result<(), Error> = if let Some(sm) =
+            self.pairing_sm.as_mut().filter(|sm| Self::sm_owns_connection(sm, storage))
+        {
             let mut ops = PairingOpsImpl {
                 bonds,
                 events,
@@ -519,7 +530,7 @@ impl Inner {
         connections: &ConnectionManager<'_, P>,
         storage: &mut ConnectionStorage<P::Packet>,
     ) {
-        if let Some(sm) = self.pairing_sm.as_mut() {
+        if let Some(sm) = self.pairing_sm.as_mut().filter(|sm| Self::sm_owns_connection(sm, storage)) {
             // If we were waiting for bonded encryption, mark the bond as
             // rejected on this connection so the next pairing attempt will
             // skip bonded encryption and initiate fresh pairing instead.
