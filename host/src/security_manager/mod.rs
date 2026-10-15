@@ -219,12 +219,19 @@ impl Inner {
 
     /// Get the local address to use for pairing calculations.
     /// When privacy is enabled and a local RPA was used for this connection, use it;
+    /// otherwise use the address of the advertising set that made the connection, if it had one;
     /// otherwise fall back to the identity address.
     fn connection_local_address<P>(&self, storage: &ConnectionStorage<P>) -> Result<Address, Error> {
         if let Some(rpa) = storage.resolvable_addrs.local {
             return Ok(Address {
                 kind: bt_hci::param::AddrKind::RANDOM,
                 addr: rpa,
+            });
+        }
+        if let Some(addr) = storage.local_address {
+            return Ok(Address {
+                kind: bt_hci::param::AddrKind::RANDOM,
+                addr,
             });
         }
         self.state.local_address.ok_or(Error::InvalidValue)
@@ -1408,6 +1415,25 @@ mod tests {
             );
             assert!(inner.pairing_sm.is_some());
             assert_eq!(inner.pairing_sm.as_ref().unwrap().peer_address(), other);
+            Ok(())
+        }));
+    }
+
+    #[test]
+    fn local_address_prefers_the_connections_adv_set() {
+        let mgr = setup_manager();
+        let handle = ConnHandle::new(5);
+        let peer = Address::random([0x13, 2, 3, 4, 5, 6]);
+        unwrap!(mgr.connect(handle, peer, LeConnRole::Peripheral, ConnParams::new()));
+        let inner = test_inner(peer);
+        let global = unwrap!(inner.state.local_address);
+        let set_address = Address::random([0x21, 2, 3, 4, 5, 0xC6]);
+
+        unwrap!(mgr.with_connected_handle(handle, |storage| {
+            storage.local_address = Some(set_address.addr);
+            assert_eq!(inner.connection_local_address(storage), Ok(set_address));
+            storage.local_address = None;
+            assert_eq!(inner.connection_local_address(storage), Ok(global));
             Ok(())
         }));
     }
