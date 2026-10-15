@@ -224,6 +224,7 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
 
         // Clear current advertising terminations
         host.advertise_state().reset();
+        host.command(LeClearAdvSets::new()).await?;
 
         for (i, set) in sets.iter().enumerate() {
             let handle = AdvHandle::new(i as u8);
