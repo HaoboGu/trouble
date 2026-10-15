@@ -5,7 +5,7 @@ use core::future::Future;
 use core::num::NonZeroU16;
 use core::task::{Context, Poll};
 
-use bt_hci::param::{AddrKind, BdAddr, ConnHandle, DisconnectReason, LeConnRole, Status};
+use bt_hci::param::{AddrKind, AdvHandle, BdAddr, ConnHandle, DisconnectReason, LeConnRole, Status};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::waitqueue::WakerRegistration;
@@ -354,6 +354,22 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
         self.connection(index).peer_identity
     }
 
+    pub(crate) fn adv_handle(&self, index: u8) -> Option<AdvHandle> {
+        self.connection(index).adv_handle
+    }
+
+    pub(crate) fn local_address(&self, index: u8) -> Option<BdAddr> {
+        self.connection(index).local_address
+    }
+
+    /// Records that advertising set `adv`, advertising as `addr`, made the connection `handle`.
+    pub(crate) fn set_adv_source(&self, handle: ConnHandle, adv: AdvHandle, addr: BdAddr) {
+        if let Some(mut storage) = self.connection_by_handle_mut(handle) {
+            storage.adv_handle = Some(adv);
+            storage.local_address = Some(addr);
+        }
+    }
+
     pub(crate) fn params(&self, index: u8) -> ConnParams {
         self.connection(index).params
     }
@@ -533,6 +549,8 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 #[cfg(not(feature = "security"))]
                 let identity = Identity::from(peer_addr);
                 storage.peer_identity = identity;
+                storage.adv_handle = None;
+                storage.local_address = None;
                 storage.role = role;
                 storage.params = params;
                 #[cfg(feature = "subrating")]
@@ -1168,6 +1186,10 @@ pub struct ConnectionStorage<P> {
     pub handle: ConnHandle,
     pub role: LeConnRole,
     pub peer_identity: Identity,
+    /// The advertising set that made this connection, from LE Advertising Set Terminated.
+    pub adv_handle: Option<AdvHandle>,
+    /// That advertising set's own random address: our address on this connection.
+    pub local_address: Option<BdAddr>,
     pub params: ConnParams,
     #[cfg(feature = "subrating")]
     pub subrating_params: Option<SubratingParams>,
@@ -1290,6 +1312,8 @@ impl<P> ConnectionStorage<P> {
                 #[cfg(feature = "security")]
                 irk: None,
             },
+            adv_handle: None,
+            local_address: None,
             params: ConnParams::new(),
             #[cfg(feature = "subrating")]
             subrating_params: None,
