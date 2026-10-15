@@ -46,13 +46,11 @@ use bt_hci::event::le::{
 #[cfg(feature = "iso")]
 use bt_hci::event::le::{LeCisEstablished, LeCisRequest};
 use bt_hci::event::{DisconnectionComplete, EventKind, NumberOfCompletedPackets, Vendor};
-#[cfg(feature = "security")]
-use bt_hci::param::BdAddr;
 #[cfg(feature = "scan")]
 use bt_hci::param::FilterDuplicates;
 use bt_hci::param::{
-    AddrKind, AdvHandle, AdvSet, ConnHandle, DisconnectReason, EventMask, EventMaskPage2, LeConnRole, LeEventMask,
-    Status,
+    AddrKind, AdvHandle, AdvSet, BdAddr, ConnHandle, DisconnectReason, EventMask, EventMaskPage2, LeConnRole,
+    LeEventMask, Status,
 };
 use bt_hci::{ControllerToHostPacket, FromHciBytes, WriteHci};
 use embassy_futures::select::{select3, select5, Either3, Either5};
@@ -221,7 +219,8 @@ pub(crate) struct InitialState {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AdvHandleState {
     None,
-    Advertising(AdvHandle),
+    /// The handle, and the set's own random address if it has one.
+    Advertising(AdvHandle, Option<BdAddr>),
     Terminated(AdvHandle),
 }
 
@@ -249,13 +248,29 @@ impl<'d> AdvState<'d> {
     pub(crate) fn terminate(&self, handle: AdvHandle) {
         for entry in self.handles.borrow_mut().iter_mut() {
             match entry {
-                AdvHandleState::Advertising(h) if *h == handle => {
+                AdvHandleState::Advertising(h, _) if *h == handle => {
                     *entry = AdvHandleState::Terminated(handle);
                 }
                 _ => {}
             }
         }
         self.waker.borrow_mut().wake();
+    }
+
+    pub(crate) fn set_address(&self, handle: AdvHandle, addr: Option<BdAddr>) {
+        for entry in self.handles.borrow_mut().iter_mut() {
+            match entry {
+                AdvHandleState::Advertising(h, a) if *h == handle => *a = addr,
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn address_of(&self, handle: AdvHandle) -> Option<BdAddr> {
+        self.handles.borrow().iter().find_map(|entry| match entry {
+            AdvHandleState::Advertising(h, a) if *h == handle => *a,
+            _ => None,
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -270,7 +285,7 @@ impl<'d> AdvState<'d> {
         }
 
         for (idx, entry) in sets.iter().enumerate() {
-            handles[idx] = AdvHandleState::Advertising(entry.adv_handle);
+            handles[idx] = AdvHandleState::Advertising(entry.adv_handle, None);
         }
     }
 
@@ -691,6 +706,16 @@ where
     #[cfg(feature = "iso")]
     pub(crate) async fn write_iso_data(&self, packet: &bt_hci::data::IsoPacket<'_>) -> Result<(), T::Error> {
         self.controller.write_iso_data(packet).await
+    }
+
+    /// A set that made a connection hands its address over to that connection.
+    fn on_adv_set_terminated(&self, set: &LeAdvertisingSetTerminated) {
+        if set.status.to_result().is_ok() {
+            if let Some(addr) = self.state.advertise_state.address_of(set.adv_handle) {
+                self.state.connections.set_adv_source(set.handle, set.adv_handle, addr);
+            }
+        }
+        self.state.advertise_state.terminate(set.adv_handle);
     }
 
     fn handle_connection(
@@ -1495,7 +1520,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                 }
                                 LeEventKind::LeAdvertisingSetTerminated => {
                                     let set = unwrap!(LeAdvertisingSetTerminated::from_hci_bytes_complete(event.data));
-                                    host.state.advertise_state.terminate(set.adv_handle);
+                                    host.on_adv_set_terminated(&set);
                                 }
                                 LeEventKind::LeExtendedAdvertisingReport => {
                                     #[cfg(feature = "scan")]
@@ -2256,6 +2281,9 @@ mod tests {
     use bt_hci::param::{PhyKind, Status};
 
     use super::*;
+    use crate::mock_controller::MockController;
+    use crate::prelude::DefaultPacketPool;
+    use crate::HostResources;
 
     #[test]
     fn phy_update_complete() {
@@ -2324,9 +2352,7 @@ mod tests {
     fn deferred_resolving_list_sync_keeps_the_update() {
         use embassy_futures::block_on;
 
-        use crate::mock_controller::MockController;
-        use crate::prelude::DefaultPacketPool;
-        use crate::{Address, HostResources, Identity};
+        use crate::Identity;
 
         let mut resources: HostResources<DefaultPacketPool, 2, 2> = HostResources::new();
         let builder = crate::new(MockController::new(), &mut resources);
@@ -2354,5 +2380,47 @@ mod tests {
             ble.state.resolving_list_state.borrow().state,
             Some(ResolvingListUpdate::FullSync)
         ));
+    }
+
+    /// Connects a peripheral on handle 0, runs `between`, then accepts the connection.
+    fn accept_with<F: FnOnce(BleHost<'_, MockController, DefaultPacketPool>)>(
+        between: F,
+    ) -> (Option<AdvHandle>, Option<BdAddr>) {
+        let mut resources: HostResources<DefaultPacketPool, 1, 1> = HostResources::new();
+        let stack = crate::new(MockController::new(), &mut resources).build();
+        let host = stack.host();
+        unwrap!(host.connections().connect(
+            ConnHandle::new(0),
+            Address::random([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]),
+            LeConnRole::Peripheral,
+            ConnParams::new(),
+        ));
+        between(host);
+        let Poll::Ready(conn) = host.connections().poll_accept(LeConnRole::Peripheral, &[], None) else {
+            panic!("no connection to accept");
+        };
+        (conn.adv_handle(), conn.local_address())
+    }
+
+    #[test]
+    fn terminated_set_records_local_address() {
+        let addr = BdAddr::new([1, 2, 3, 4, 5, 0xC6]);
+        let source = accept_with(|host| {
+            host.advertise_state().start(&[AdvSet {
+                adv_handle: AdvHandle::new(0),
+                duration: bt_hci::param::Duration::from_u16(0),
+                max_ext_adv_events: 0,
+            }]);
+            host.advertise_state().set_address(AdvHandle::new(0), Some(addr));
+            // Status, advertising handle, connection handle, completed events
+            let set = unwrap!(LeAdvertisingSetTerminated::from_hci_bytes_complete(&[0, 0, 0, 0, 0]));
+            host.on_adv_set_terminated(&set);
+        });
+        assert_eq!(source, (Some(AdvHandle::new(0)), Some(addr)));
+    }
+
+    #[test]
+    fn connection_without_terminated_event_has_no_source() {
+        assert_eq!(accept_with(|_| {}), (None, None));
     }
 }

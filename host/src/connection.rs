@@ -9,8 +9,8 @@ use bt_hci::cmd::le::{
 use bt_hci::cmd::status::ReadRssi;
 use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use bt_hci::param::{
-    AllPhys, ConnHandle, DisconnectReason, FilterDuplicates, FrameSpaceInitiator, LeConnRole, PhyKind, PhyMask,
-    PhyOptions, SpacingTypes, Status,
+    AdvHandle, AllPhys, BdAddr, ConnHandle, DisconnectReason, FilterDuplicates, FrameSpaceInitiator, LeConnRole,
+    PhyKind, PhyMask, PhyOptions, SpacingTypes, Status,
 };
 #[cfg(feature = "connection-params-update")]
 use bt_hci::{
@@ -679,6 +679,16 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
     /// The peer identity key for this connection.
     pub fn peer_identity(&self) -> Identity {
         self.manager.peer_identity(self.index)
+    }
+
+    /// The extended advertising set that made this connection, if one did.
+    pub fn adv_handle(&self) -> Option<AdvHandle> {
+        self.manager.adv_handle(self.index)
+    }
+
+    /// Our address on this connection, if the extended advertising set that made it had its own address.
+    pub fn local_address(&self) -> Option<BdAddr> {
+        self.manager.local_address(self.index)
     }
 
     /// The current connection params
