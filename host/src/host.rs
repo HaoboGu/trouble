@@ -657,6 +657,15 @@ where
         self.state.initialized.try_get().is_some()
     }
 
+    /// Marks the host initialized without a Runner, so that tests can send commands.
+    #[cfg(test)]
+    pub(crate) fn init_for_test(&self) {
+        let _ = self.state.initialized.init(InitialState {
+            acl_max: 1,
+            acl_total: 1,
+        });
+    }
+
     /// Run a HCI command and return the response.
     pub(crate) async fn command<C>(&self, cmd: C) -> Result<C::Return, BleHostError<T::Error>>
     where

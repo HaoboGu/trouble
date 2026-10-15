@@ -225,6 +225,9 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
         // Clear current advertising terminations
         host.advertise_state().reset();
 
+        // Reusing a handle that held data for a directed set fails with 0x12 (HCI 7.8.53).
+        host.command(LeClearAdvSets::new()).await?;
+
         for (i, set) in sets.iter().enumerate() {
             let handle = AdvHandle::new(i as u8);
             let data: RawAdvertisement<'k> = set.data.into();
@@ -410,6 +413,8 @@ impl<C, P: PacketPool> Drop for Advertiser<'_, C, P> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use bt_hci::param::{AddrKind, BdAddr, ConnHandle, LeConnRole};
     use embassy_futures::block_on;
 
@@ -474,5 +479,41 @@ mod tests {
         let _conn = block_on(advertiser.accept()).unwrap();
 
         assert!(host.advertise_command_state().is_idle());
+    }
+
+    #[cfg(feature = "extended-advertising")]
+    #[test]
+    fn advertise_ext_clears_sets_before_configuring() {
+        use core::cell::RefCell;
+        use std::rc::Rc;
+        use std::vec::Vec;
+
+        use bt_hci::cmd::le::{LeClearAdvSets, LeSetExtAdvParams};
+        use bt_hci::cmd::Cmd;
+
+        use crate::advertise::{Advertisement, AdvertisementSet};
+        use crate::mock_controller::RecordingController;
+
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let mut resources: HostResources<DefaultPacketPool, 1, 1, 1> = HostResources::new();
+        let stack = crate::new(RecordingController { sent: sent.clone() }, &mut resources).build();
+        let mut peripheral = stack.peripheral();
+        // host.command() waits for the runner to mark the host initialized.
+        peripheral.host.init_for_test();
+        let sets = [AdvertisementSet {
+            params: Default::default(),
+            data: Advertisement::ConnectableScannableUndirected {
+                // Flags: LE General Discoverable, BR/EDR Not Supported.
+                adv_data: &[0x02, 0x01, 0x06],
+                scan_data: &[],
+            },
+            address: None,
+        }];
+        let mut handles = AdvertisementSet::handles(&sets);
+        let _advertiser = block_on(peripheral.advertise_ext(&sets, &mut handles)).unwrap();
+        let sent = sent.borrow();
+        let clear = sent.iter().position(|op| *op == LeClearAdvSets::OPCODE).unwrap();
+        let params = sent.iter().position(|op| *op == LeSetExtAdvParams::OPCODE).unwrap();
+        assert!(clear < params);
     }
 }
