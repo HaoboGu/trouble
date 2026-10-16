@@ -5,6 +5,8 @@ use core::future::Future;
 use core::num::NonZeroU16;
 use core::task::{Context, Poll};
 
+#[cfg(feature = "extended-advertising")]
+use bt_hci::param::AdvHandle;
 use bt_hci::param::{AddrKind, BdAddr, ConnHandle, DisconnectReason, LeConnRole, Status};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
@@ -354,6 +356,15 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
         self.connection(index).peer_identity
     }
 
+    /// Records that advertising set `adv`, advertising as `addr`, made the connection `handle`.
+    #[cfg(feature = "extended-advertising")]
+    pub(crate) fn set_adv_source(&self, handle: ConnHandle, adv: AdvHandle, addr: Option<BdAddr>) {
+        if let Some(mut storage) = self.connection_by_handle_mut(handle) {
+            storage.adv_handle = Some(adv);
+            storage.local_address = addr;
+        }
+    }
+
     pub(crate) fn params(&self, index: u8) -> ConnParams {
         self.connection(index).params
     }
@@ -533,6 +544,11 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 #[cfg(not(feature = "security"))]
                 let identity = Identity::from(peer_addr);
                 storage.peer_identity = identity;
+                #[cfg(feature = "extended-advertising")]
+                {
+                    storage.adv_handle = None;
+                    storage.local_address = None;
+                }
                 storage.role = role;
                 storage.params = params;
                 #[cfg(feature = "subrating")]
@@ -1168,6 +1184,12 @@ pub struct ConnectionStorage<P> {
     pub handle: ConnHandle,
     pub role: LeConnRole,
     pub peer_identity: Identity,
+    /// The advertising set that made this connection, from LE Advertising Set Terminated.
+    #[cfg(feature = "extended-advertising")]
+    pub adv_handle: Option<AdvHandle>,
+    /// That advertising set's own random address: our address on this connection.
+    #[cfg(feature = "extended-advertising")]
+    pub local_address: Option<BdAddr>,
     pub params: ConnParams,
     #[cfg(feature = "subrating")]
     pub subrating_params: Option<SubratingParams>,
@@ -1290,6 +1312,10 @@ impl<P> ConnectionStorage<P> {
                 #[cfg(feature = "security")]
                 irk: None,
             },
+            #[cfg(feature = "extended-advertising")]
+            adv_handle: None,
+            #[cfg(feature = "extended-advertising")]
+            local_address: None,
             params: ConnParams::new(),
             #[cfg(feature = "subrating")]
             subrating_params: None,
