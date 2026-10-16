@@ -38,11 +38,11 @@ fn build_sdc<'d, const N: usize>(
     mem: &'d mut sdc::Mem<N>,
 ) -> Result<nrf_sdc::SoftdeviceController<'d>, nrf_sdc::Error> {
     sdc::Builder::new()?
-        .support_le_coded_phy()
-        .support_le_2m_phy()
         .support_adv()
         .support_ext_adv()
-        .adv_count(2)?
+        .adv_count(1)?
+        .support_peripheral()
+        .peripheral_count(2)?
         .build(p, rng, mpsl, mem)
 }
 
