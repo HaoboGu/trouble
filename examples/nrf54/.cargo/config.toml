@@ -2,7 +2,7 @@
 #runner = "probe-rs run --chip nRF52832_xxAA"
 #runner = "probe-rs run --chip nRF52833_xxAA"
 # runner = "probe-rs run --chip nRF54l15"
-runner = "probe-rs run --chip nRF54lm20a"
+runner = "probe-rs run --chip nRF54LM20A"
 
 [build]
 target = "thumbv8m.main-none-eabihf"

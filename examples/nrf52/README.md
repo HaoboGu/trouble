@@ -57,3 +57,21 @@ This is required for the GATT examples on the nRF52810: with the default feature
 flash by a few KB.
 
 See [microbit-bsp](https://github.com/lulf/microbit-bsp) for more examples of setting up nrf devices with trouble, specifically the BBC Microbit which is an nrf52833.
+
+## Per-connection advertising addresses
+
+Run `cargo run --release --features nrf52840,security --bin ble_advertise_multiple`.
+Connect one BLE client to **TrouBLE A**, read Battery Level (42), and wait for
+`security complete` with `new_bond=true, bonded_peer=true`. Keep A connected, then
+connect another client to **TrouBLE B**. Pair A before connecting B: the security
+manager supports one pairing at a time.
+Each accept must immediately report its configured address; both connections must
+retain different addresses after advertising set 0 is reused.
+Wait for pairing and encryption logs for both addresses, then disconnect both and
+reconnect without resetting the board to exercise connection-slot reuse. Each should
+report `known_bond=true`, then `link encrypted` with `bonded_peer=true`, without
+creating a new bond. `new_bond` describes the security event's payload, not whether
+an older bond exists. Connection logs show the local address, and Battery Level
+reads are logged with A or B; also check that each client receives 42.
+Bonds are kept in RAM; after resetting the board, remove the clients' old bonds
+before pairing again. Omit `security` to check only address tracking.
